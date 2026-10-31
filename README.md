@@ -1,61 +1,63 @@
 # worktree-sup
 
-`wsup`は、fxを利用するGit worktree管理CLIです。Goで実装し、作成・一覧・通常マージ・承認付き競合解消・安全な削除を支援します。
+English | [日本語](README.ja.md)
 
-## ビルド
+`wsup` is a Git worktree management CLI powered by fx. Written in Go, it supports worktree creation, listing, regular merges, approval-based conflict resolution, and safe removal.
 
-Go 1.23以降、Git（`worktree list --porcelain -z`対応版）が必要です。
+## Build
+
+Requires Go 1.23 or later and Git with support for `worktree list --porcelain -z`.
 
 ```sh
 go build -o wsup ./cmd/wsup
-# または
+# Or install:
 go install ./cmd/wsup
 ```
 
-fx連携は現在 **macOS + native Mach-O版fx + `/usr/bin/sandbox-exec`** のみ対応します。LinuxではLLMが必要な処理を停止し、隔離なしの実行には切り替えません。シェルラッパー版fxも拒否します。`fx`はPATHから検索します。
+fx integration currently requires **macOS, a native Mach-O fx binary, and `/usr/bin/sandbox-exec`**. On Linux, operations requiring an LLM stop rather than falling back to unsandboxed execution. Shell wrappers around fx are also rejected. The executable is located through `PATH`.
 
-通常のfx設定・保存済みログイン・MCP・skillsは引き継ぎません。隔離された一時HOMEでfxを起動するため、対応プロバイダのAPIキーを環境変数で用意してください。許可するのは`AI_GATEWAY_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`のみです。プロバイダ選択はfxの初期設定に従うため、初期設定のGatewayを使う場合は`AI_GATEWAY_API_KEY`が必要です。認証や出力に問題があれば停止します。
+Your normal fx configuration, saved logins, MCP servers, and skills are not inherited. fx runs with an isolated temporary HOME, so provide a supported provider's API key through an environment variable. Only `AI_GATEWAY_API_KEY`, `OPENAI_API_KEY`, and `ANTHROPIC_API_KEY` are forwarded. Provider selection follows fx's defaults; the default Gateway requires `AI_GATEWAY_API_KEY`. Authentication failures or invalid output stop the operation.
 
-## 使い方
+## Usage
 
-Gitリポジトリ内で実行します。対話入力は改行で確定し、承認は`yes`を明示した場合のみ有効です。
+Run inside a Git repository. Submit interactive input with Enter. Approval requires an explicit `yes`.
 
 ```sh
-wsup new --base main 'ログイン画面の入力検証を改善する'
+wsup new --base main 'Improve login form validation'
 wsup list
 wsup merge
 wsup merge --target release
 wsup remove
 ```
 
-- `new`: 作業内容と起点を指定（省略時は質問）。fxが短いブランチ名と日本語の要約を生成します。名前の安全性・重複・保存先を検証し、起点／名前／要約／パスを表示して作成します。既存の変更は移動・コピーしません。
-- 保存先は最初のworktreeのパスに`.worktrees`を付けた隣接ディレクトリです。ブランチ名中の`/`は保存先では`-`に変換し、衝突時は停止します。
-- `list`: fxを呼ばず読み取り専用で表示します。外部で作成されたworktreeは`未登録`です。
-- `merge`: 管理対象の一覧から選択します。統合先の既定値は作成時の起点です。`--target`による変更は記録します。統合先は別worktreeにcheckout済みである必要があります。自動checkoutはしません。
-- `remove`: 管理対象の一覧から選択し、パス・ブランチ・統合状態を表示して削除確認します。クリーンかつ記録された統合先に祖先として取り込み済みの場合のみ削除します。ignoredファイルも残っていれば停止します。現在のディレクトリを含むworktreeは削除できません。
+- `new`: Provide a task description and base branch, or enter them when prompted. fx generates a short branch name and a Japanese summary. The CLI validates the name, checks for duplicates and a safe destination, then displays the base, name, summary, and path before creation. Existing changes are never moved or copied.
+- Worktrees are stored in a sibling directory formed by appending `.worktrees` to the primary worktree's path. Slashes in branch names become hyphens in destination paths. A collision stops the operation.
+- `list`: Displays a read-only listing without calling fx. A horizontal rule separates the headings from the values, and only headings are bold in terminals. Styling is disabled for redirected output, when `NO_COLOR` is set, or with `TERM=dumb`. `PATH` is relative to the main repository root—the primary worktree—with `.` representing the root itself. This base stays the same when running from a linked worktree. Externally created worktrees are labeled `未登録` (unregistered).
+- `merge`: Select a managed worktree from a list. The default target is its original base branch. Changes made with `--target` are recorded. The target must already be checked out in another worktree; automatic checkout is not performed.
+- `remove`: Select a managed worktree, review its path, branch, and integration status, then confirm removal. Removal is allowed only when the worktree is clean and its commits are ancestors of the recorded target. Remaining ignored files also block removal. A worktree containing the current directory cannot be removed.
 
-未コミット変更・未追跡ファイル・進行中のGit操作がある対象ではマージ／削除を止めます。取り込み元のパスと衝突するignoredファイルも上書きしません。通常のマージが競合マーカーを生成することは実行前に表示します。
+Merging or removal stops if an affected worktree has uncommitted changes, untracked files, or an ongoing Git operation. Ignored files that collide with incoming paths are not overwritten. Before merging, the CLI warns that a regular Git merge may produce conflict markers.
 
-## 競合解消とテスト
+## Conflict resolution and tests
 
-競合時は、ベース・双方の内容・現在の競合ファイルをfxに送り、変更意図・方針・具体的な差分を表示します。承認前に解消編集・ステージング・コミットは行いません。承認はその差分と状態にのみ有効です。HEAD・インデックス・ファイルが変わっていれば適用しません。
+When conflicts occur, wsup sends the base, both sides, and current conflicted file contents to fx. It displays the change intent, resolution plan, and exact proposed patch. No resolution edits, staging, or commits occur before approval. Approval applies only to that patch and repository state. Changes to HEAD, the index, or files prevent application.
 
-初版の自動解消はUTF-8の通常ファイルを対象とします。バイナリ、symlink、submodule、削除を伴う競合、モード変更などは安全側に停止します。送信する競合コンテキストと差分の上限は各2 MiBです。秘密情報を含むファイルの送信には注意してください。
+The initial implementation supports automatic resolution of regular UTF-8 text files. Binary files, symlinks, submodules, conflicts involving deletions, mode changes, and other unsupported cases stop safely. Conflict context and patches are each limited to 2 MiB. Take care when sending files containing secrets.
 
-リポジトリ単位のテストを明示設定できます。コマンドは引数配列として実行し、暗黙のシェル解釈は行いません。
+You can explicitly configure a repository-wide test command. It is executed as an argument array, without implicit shell interpretation.
 
 ```sh
 wsup config test -- go test ./...
 wsup config test --clear
 ```
 
-競合解消後は、未解消競合がないことを確認し、完了確認を得てテストを実行します。失敗時はマージコミットを作りません。テストが対象の追跡ファイル／インデックス等を変更した場合も停止します。追加の修正を古い承認で自動適用することはありません。テスト未設定時は未検証と表示し、続行確認を求めます。
+After applying an approved resolution, wsup checks that no unresolved conflicts remain, asks for completion confirmation, and runs the configured tests. Test failures prevent the merge commit. Tests that modify tracked files, the index, or other checked state also stop completion. Additional fixes are never applied automatically using an old approval. Without configured tests, wsup reports the merge as unverified and asks whether to continue.
 
-競合のない通常マージは追加承認・テスト実行なしで完了します。自動rebase・squash・push・commit/stashによる既存変更の整理・強制削除・マージ後の自動削除は行いません。
+Conflict-free regular merges complete without additional approval or tests. wsup does not automatically rebase, squash, push, commit or stash existing changes, force removal, or remove worktrees after merging.
 
-## 中断・再開
+## Interruption and recovery
 
-共有Gitディレクトリの`wsup/`に要約・起点・統合先・設定・処理段階・提案差分を保存します。worktree間で共有され、Gitの追跡対象にはなりません。変更操作は共有ディレクトリの`wsup.lock`をOSロックして直列化します。プロセス終了時にはロックが解放されます。
+Summaries, base and target branches, configuration, operation stages, and proposed patches are stored under `wsup/` in the shared Git directory. This metadata is shared across worktrees and is not tracked by Git. Mutating operations are serialized using an OS lock on `wsup.lock` in the shared directory. The lock is released when the process exits.
 
 ```sh
 wsup status
@@ -63,27 +65,27 @@ wsup resume
 wsup abort
 ```
 
-- `resume`は現在の状態を確認してから再開します。未適用の競合解消案は再生成し、新しい承認を必要とします。適用済みなら保存時の状態との一致を確認し、テスト／完了について再確認します。
-- `abort`は明示確認を得て操作記録を中止します。作成済みworktreeや部分的に削除済みの資源は自動復元・削除しません。
-- 進行中のマージの中止は、保存した状態と一致する場合のみ`git merge --abort`を実行します。中断後に手作業で変更した場合は自動復旧せず停止します。状態を確認し、必要なら対象worktree内で手動で`git merge --abort`してください。
-- Git実行と状態保存は単一トランザクションではありません。再開時に安全性を確認できない状態（ブランチだけ作成された場合など）は停止し、手動確認を必要とします。
+- `resume` checks the current state before continuing. Unapplied resolution proposals are regenerated and require new approval. If a resolution was already applied, wsup verifies the saved state and asks again before testing and completing the merge.
+- `abort` requires explicit confirmation and marks the operation as aborted. It does not automatically restore or delete already-created worktrees or partially removed resources.
+- A pending merge is aborted with `git merge --abort` only when its state matches the saved snapshot. Manual changes after interruption prevent automatic recovery. Inspect the state and, if necessary, run `git merge --abort` manually in the target worktree.
+- Git execution and state persistence are not a single transaction. Recovery stops when safety cannot be established, such as when only a branch was created, and requires manual inspection.
 
-手動Gitや外部エージェントはwsupのロックに従いません。操作直前の再検証とref削除時の比較で変更を検出しますが、外部操作との完全な原子性は保証しません。同じworktreeへの同時編集は避けてください。
+Manual Git commands and external agents do not honor wsup's lock. Immediate revalidation and compare-and-delete ref operations detect changes, but full atomicity with external operations is not guaranteed. Avoid concurrent edits to the same worktree.
 
-## fxの隔離境界
+## fx isolation boundary
 
-fxにはGitリポジトリを直接読ませず、必要なテキストだけ標準入力から渡します。実行環境側でリポジトリの読み取り、一時領域以外へのファイル書き込み、fork、shellやGitなどの別プログラムの起動を禁止します。Gitの変更はCLIが検証した引数／承認済み差分で実行し、Git hooksと署名の自動起動も無効にします。
+fx does not read the Git repository directly. Only the required text is passed through standard input. Runtime restrictions deny repository reads, file writes outside the temporary directory, forking, and execution of other programs such as shells or Git. Git mutations are performed by the CLI using validated arguments and approved patches. Automatic Git hooks and signing are also disabled.
 
-ネットワークはモデル接続のため許可されます。これは完全なネットワーク隔離ではなく、送信した内容・APIキーの外部送信やネットワーク経由の副作用を防ぐものではありません。インストール済みfx・モデル提供元・明示設定するテストコマンド・Git設定は信頼する前提です。
+Network access is allowed for model connections. This is not complete network isolation: it does not prevent exfiltration of supplied content or API keys, or network-mediated side effects. The installed fx binary, model provider, explicitly configured test commands, and Git configuration are trusted.
 
-## 開発・検証
+## Development and verification
 
 ```sh
 go test ./...
 go test -race ./...
 go vet ./...
-# インストール済みfxを隔離してhelp/versionだけ検証（モデル呼び出しなし）
+# Check installed fx help/version in isolation, without calling a model:
 WSUP_FX_SMOKE=1 go test ./internal/wsup -run '^TestFXInstalledSmoke$' -v
 ```
 
-テストは一時Gitリポジトリと偽のLLMエンジンを使います。通常のテストでライブモデルやAPI課金は発生しません。実モデルとの認証・応答互換性は別途実環境での検証が必要です。
+Tests use temporary Git repositories and fake LLM engines. Normal tests do not call live models or incur API charges. Authentication and response compatibility with a real model require separate verification in your environment.

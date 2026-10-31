@@ -113,7 +113,11 @@ func TestAppNewListMergeRemove(t *testing.T) {
 			}
 			out.Reset()
 			appTestOK(t, a, "", "list")
-			for _, text := range []string{"BRANCH", "main", e.Branch, e.Summary, e.Path, "clean"} {
+			relative, err := filepath.Rel(a.Repo.Root, e.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, text := range []string{"BRANCH", "main", e.Branch, e.Summary, filepath.ToSlash(relative), "clean", "─"} {
 				if !strings.Contains(out.String(), text) {
 					t.Errorf("list missing %q: %s", text, out)
 				}

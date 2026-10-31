@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"text/tabwriter"
 )
 
 const help = `worktree-sup (wsup) — fxを使うGit worktree管理CLI
@@ -161,8 +160,12 @@ func (a *App) list() error {
 	if err != nil {
 		return err
 	}
-	w := tabwriter.NewWriter(a.Out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "BRANCH\tSUMMARY\tPATH\tSTATE")
+	// Git lists the primary worktree first, even from a linked worktree.
+	root := a.Repo.Root
+	if len(trees) > 0 {
+		root = trees[0].Path
+	}
+	rows := [][]string{{"BRANCH", "SUMMARY", "PATH", "STATE"}}
 	for _, t := range trees {
 		summary := "未登録"
 		if e, ok := m.Entries[t.Branch]; ok && e.Path == t.Path {
@@ -178,9 +181,13 @@ func (a *App) list() error {
 		if t.Detached {
 			branch = "(detached)"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", branch, summary, t.Path, state)
+		path, err := filepath.Rel(root, t.Path)
+		if err != nil {
+			return fmt.Errorf("worktreeの相対パス: %w", err)
+		}
+		rows = append(rows, []string{branch, summary, filepath.ToSlash(path), state})
 	}
-	return w.Flush()
+	return writeTable(a.Out, rows)
 }
 func (a *App) selectEntry() (Entry, error) {
 	trees, err := a.Repo.Worktrees()

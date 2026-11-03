@@ -216,14 +216,7 @@ func (a *App) list() error {
 	}
 	return writeTable(a.Out, rows)
 }
-func (a *App) selectEntry() (Entry, error) {
-	entries, err := a.selectEntries(false)
-	if err != nil {
-		return Entry{}, err
-	}
-	return entries[0], nil
-}
-func (a *App) selectEntries(multiple bool) ([]Entry, error) {
+func (a *App) selectEntries() ([]Entry, error) {
 	trees, err := a.Repo.Worktrees()
 	if err != nil {
 		return nil, err
@@ -242,22 +235,15 @@ func (a *App) selectEntries(multiple bool) ([]Entry, error) {
 	if len(candidates) == 0 {
 		return nil, errors.New("no managed worktrees; create one with wsup new")
 	}
-	prompt := "Selection number"
-	if multiple {
-		prompt = "Selection numbers in merge order (e.g. 1 3) or all"
-	}
-	choice, err := a.ask(prompt)
+	choice, err := a.ask("Selection numbers in execution order (e.g. 1 3) or all")
 	if err != nil {
 		return nil, err
 	}
-	choices := []string{choice}
-	if multiple {
-		choices = strings.Fields(choice)
-		if choice == "all" {
-			choices = nil
-			for i := range candidates {
-				choices = append(choices, strconv.Itoa(i+1))
-			}
+	choices := strings.Fields(choice)
+	if choice == "all" {
+		choices = nil
+		for i := range candidates {
+			choices = append(choices, strconv.Itoa(i+1))
 		}
 	}
 	if len(choices) == 0 {
@@ -508,7 +494,7 @@ func (a *App) merge(ctx context.Context, args []string) error {
 	if f.NArg() != 0 {
 		return errors.New("select from the list")
 	}
-	entries, err := a.selectEntries(true)
+	entries, err := a.selectEntries()
 	if err != nil {
 		return err
 	}
@@ -665,10 +651,31 @@ func (a *App) checkMergeStart(s *State) error {
 	return nil
 }
 func (a *App) remove() error {
-	e, err := a.selectEntry()
+	entries, err := a.selectEntries()
 	if err != nil {
 		return err
 	}
+	completed := 0
+	defer func() {
+		if completed < len(entries) {
+			fmt.Fprintln(a.Out, "Batch stopped. Remaining selections (rerun wsup remove after resolving the current operation):")
+			for _, e := range entries[completed:] {
+				fmt.Fprintln(a.Out, e.Branch)
+			}
+		}
+	}()
+	for _, e := range entries {
+		if err := a.operationContext().Err(); err != nil {
+			return err
+		}
+		if err := a.removeEntry(e); err != nil {
+			return err
+		}
+		completed++
+	}
+	return nil
+}
+func (a *App) removeEntry(e Entry) error {
 	head, err := a.branchHEAD(e.Branch)
 	if err != nil {
 		return err

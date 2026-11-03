@@ -184,7 +184,7 @@ func TestAppMergePreservesIgnoredTargetData(t *testing.T) {
 				t.Fatal(err)
 			}
 			err = appTestExecute(a, "1\n", "merge")
-			if err == nil || !strings.Contains(err.Error(), "ignoredファイルと衝突") || !strings.Contains(err.Error(), "feature") {
+			if err == nil || !strings.Contains(err.Error(), "collides with an ignored file") || !strings.Contains(err.Error(), "feature") {
 				t.Errorf("want ignored-file collision error identifying feature, got: %v", err)
 			}
 			if data, err := os.ReadFile(file); err != nil || string(data) != precious {
@@ -557,7 +557,7 @@ func TestAppResumedCreateRejectsReplacedParent(t *testing.T) {
 			before := appTestDiskImage(t, redirected)
 			trees := testGit(t, a.Repo.Root, "worktree", "list", "--porcelain")
 			err := appTestExecute(a, "yes\n", "resume")
-			if err == nil || !strings.Contains(err.Error(), "保存先") {
+			if err == nil || !strings.Contains(err.Error(), "destination") {
 				t.Fatalf("resume did not reject a noncanonical parent: %v", err)
 			}
 			if !reflect.DeepEqual(before, appTestDiskImage(t, redirected)) {
@@ -655,7 +655,7 @@ func TestAppListReadOnlyWithoutEngine(t *testing.T) {
 			for i := 0; i < 2; i++ {
 				appTestOK(t, a, "", "list")
 			}
-			if !strings.Contains(out.String(), "dirty") || !strings.Contains(out.String(), "未登録") {
+			if !strings.Contains(out.String(), "dirty") || !strings.Contains(out.String(), "unregistered") {
 				t.Fatal(out.String())
 			}
 			if !reflect.DeepEqual(before, appTestDiskImage(t, a.Repo.Root)) {

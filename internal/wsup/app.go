@@ -11,29 +11,34 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"golang.org/x/term"
 )
 
-const help = `worktree-sup (wsup) — fxを使うGit worktree管理CLI
+const help = `worktree-sup (wsup) — Git worktree management CLI powered by fx
 
-  wsup new [--base BRANCH] [作業内容]
+  wsup new [--base BRANCH] [TASK]
+  wsup issue [--base BRANCH]      Create worktrees for all open GitHub issues (requires gh)
   wsup list
-  wsup merge [--target BRANCH]    一覧から対象を選択
-  wsup remove                    一覧から対象を選択
+  wsup merge [--target BRANCH]    Select from the list
+  wsup remove                    Select from the list
   wsup config test -- COMMAND [ARGS...]
   wsup config test --clear
   wsup status
   wsup resume
   wsup abort
 
-競合の解消差分は承認後だけ適用します。push/rebase/squash/強制削除はしません。
-fx連携はmacOSのnative fx + sandbox-execに対応します（他環境では安全側に停止）。
+Conflict resolution changes are applied only after approval. No push, rebase, squash, or forced deletion.
+fx integration requires native fx + sandbox-exec on macOS (stops safely on other platforms).
 `
 
 type App struct {
-	Repo   *Repo
-	Engine Engine
-	In     *bufio.Reader
-	Out    io.Writer
+	Repo          *Repo
+	Engine        Engine
+	In            *bufio.Reader
+	Out           io.Writer
+	ctx           context.Context
+	inputTerminal *os.File
 }
 
 func Run(ctx context.Context, args []string, in io.Reader, out io.Writer) error {
@@ -46,6 +51,9 @@ func Run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 		return err
 	}
 	a := &App{Repo: r, In: bufio.NewReader(in), Out: out}
+	if f, ok := in.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		a.inputTerminal = f
+	}
 	trees, err := r.Worktrees()
 	if err != nil {
 		return err
@@ -58,34 +66,38 @@ func Run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 	return a.Execute(ctx, args)
 }
 func (a *App) Execute(ctx context.Context, args []string) error {
+	a.ctx = ctx
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(args) == 0 {
-		return errors.New("コマンドが必要です")
+		return errors.New("a command is required")
 	}
 	switch args[0] {
 	case "list":
 		if len(args) != 1 {
-			return errors.New("listは引数を取りません")
+			return errors.New("list takes no arguments")
 		}
 		return a.list()
 	case "status":
 		if len(args) != 1 {
-			return errors.New("statusは引数を取りません")
+			return errors.New("status takes no arguments")
 		}
 		s, err := a.loadState()
 		if err != nil {
 			return err
 		}
 		if s == nil {
-			fmt.Fprintln(a.Out, "保存された操作はありません")
+			fmt.Fprintln(a.Out, "No saved operation")
 			return nil
 		}
 		fmt.Fprintf(a.Out, "%s / %s\nsource: %s\ntarget: %s\npath: %s\n", s.Kind, s.Stage, s.Source, s.Target, s.TargetPath)
 		return nil
 	}
 	switch args[0] {
-	case "new", "merge", "remove", "config", "resume", "abort":
+	case "new", "issue", "merge", "remove", "config", "resume", "abort":
 	default:
-		return fmt.Errorf("不明なコマンド: %s", args[0])
+		return fmt.Errorf("unknown command: %s", args[0])
 	}
 	unlock, err := a.Repo.Lock()
 	if err != nil {
@@ -100,30 +112,45 @@ func (a *App) Execute(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "new":
 		return a.create(ctx, args[1:])
+	case "issue":
+		return a.createIssues(ctx, args[1:])
 	case "merge":
 		return a.merge(ctx, args[1:])
 	case "remove":
 		if len(args) != 1 {
-			return errors.New("removeは引数を取りません。一覧から選択してください")
+			return errors.New("remove takes no arguments; select from the list")
 		}
 		return a.remove()
 	case "config":
 		return a.config(args[1:])
 	case "resume", "abort":
 		if len(args) != 1 {
-			return errors.New("引数が多すぎます")
+			return errors.New("too many arguments")
 		}
 		return a.recover(ctx, args[0] == "abort")
 	}
 	return nil
 }
 func (a *App) ask(prompt string) (string, error) {
-	fmt.Fprint(a.Out, prompt+": ")
-	line, err := a.In.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("入力を完了できません: %w", err)
+	ctx := a.operationContext()
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
-	return strings.TrimSpace(line), nil
+	if _, err := fmt.Fprint(a.Out, prompt+": "); err != nil {
+		return "", err
+	}
+	line, err := readPrompt(ctx, a.In, a.Out, a.inputTerminal)
+	if err != nil {
+		return "", fmt.Errorf("could not complete input: %w", err)
+	}
+	return line, nil
+}
+
+func (a *App) operationContext() context.Context {
+	if a.ctx != nil {
+		return a.ctx
+	}
+	return context.Background()
 }
 func (a *App) confirm(prompt string) (bool, error) {
 	s, err := a.ask(prompt + " [yes/no]")
@@ -136,19 +163,19 @@ func (a *App) flags(name string) *flag.FlagSet {
 }
 func (a *App) config(args []string) error {
 	if len(args) < 2 || args[0] != "test" {
-		return errors.New("wsup config test -- COMMAND [ARGS...] または --clear")
+		return errors.New("wsup config test -- COMMAND [ARGS...] or --clear")
 	}
 	c := Config{}
 	if len(args) == 2 && args[1] == "--clear" {
 	} else if args[1] == "--" && len(args) > 2 {
 		c.Test = args[2:]
 	} else {
-		return errors.New("テストコマンドは -- の後に指定してください")
+		return errors.New("specify the test command after --")
 	}
 	if err := writeJSON(a.storage("config.json"), c); err != nil {
 		return err
 	}
-	fmt.Fprintln(a.Out, "テスト設定を保存しました")
+	fmt.Fprintln(a.Out, "Test configuration saved")
 	return nil
 }
 func (a *App) list() error {
@@ -167,7 +194,7 @@ func (a *App) list() error {
 	}
 	rows := [][]string{{"BRANCH", "SUMMARY", "PATH", "STATE"}}
 	for _, t := range trees {
-		summary := "未登録"
+		summary := "unregistered"
 		if e, ok := m.Entries[t.Branch]; ok && e.Path == t.Path {
 			summary = e.Summary
 		}
@@ -175,7 +202,7 @@ func (a *App) list() error {
 		if t.Bare {
 			state = "bare"
 		} else if err := a.Repo.Clean(t.Path); err != nil {
-			state = "dirty / 操作中 / 読取不可"
+			state = "dirty / operation in progress / unreadable"
 		}
 		branch := t.Branch
 		if t.Detached {
@@ -183,7 +210,7 @@ func (a *App) list() error {
 		}
 		path, err := filepath.Rel(root, t.Path)
 		if err != nil {
-			return fmt.Errorf("worktreeの相対パス: %w", err)
+			return fmt.Errorf("relative worktree path: %w", err)
 		}
 		rows = append(rows, []string{branch, summary, filepath.ToSlash(path), state})
 	}
@@ -206,15 +233,15 @@ func (a *App) selectEntry() (Entry, error) {
 		}
 	}
 	if len(candidates) == 0 {
-		return Entry{}, errors.New("管理対象のworktreeがありません。wsup newで作成してください")
+		return Entry{}, errors.New("no managed worktrees; create one with wsup new")
 	}
-	choice, err := a.ask("対象番号")
+	choice, err := a.ask("Selection number")
 	if err != nil {
 		return Entry{}, err
 	}
 	n, err := strconv.Atoi(choice)
 	if err != nil || n < 1 || n > len(candidates) {
-		return Entry{}, errors.New("無効な対象番号")
+		return Entry{}, errors.New("invalid selection number")
 	}
 	e := candidates[n-1]
 	return e, a.verifyEntry(e)
@@ -242,7 +269,7 @@ func (a *App) verifyEntry(e Entry) error {
 			return nil
 		}
 	}
-	return errors.New("worktreeのパスまたはブランチが記録と一致しません")
+	return errors.New("worktree path or branch does not match the record")
 }
 func (a *App) branchHEAD(branch string) (string, error) {
 	if err := ValidBranch(branch); err != nil {
@@ -263,27 +290,27 @@ func (a *App) targetPath(branch string) (string, error) {
 			return t.Path, nil
 		}
 	}
-	return "", fmt.Errorf("統合先 %s を別のworktreeにcheckoutしてください（自動checkoutはしません）", branch)
+	return "", fmt.Errorf("check out target %s in another worktree (no automatic checkout)", branch)
 }
 func (a *App) create(ctx context.Context, args []string) error {
 	f := a.flags("new")
-	base := f.String("base", "", "起点ブランチ")
+	base := f.String("base", "", "Base branch")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
 	intent := strings.Join(f.Args(), " ")
 	var err error
 	if intent == "" {
-		intent, err = a.ask("作業内容")
+		intent, err = a.ask("Task description")
 		if err != nil {
 			return err
 		}
 	}
 	if intent == "" {
-		return errors.New("作業内容は必須です")
+		return errors.New("a task description is required")
 	}
 	if *base == "" {
-		*base, err = a.ask("起点ブランチ")
+		*base, err = a.ask("Base branch")
 		if err != nil {
 			return err
 		}
@@ -293,27 +320,40 @@ func (a *App) create(ctx context.Context, args []string) error {
 		return err
 	}
 	if a.Engine == nil {
-		return errors.New("fxエンジンがありません")
+		return errors.New("fx engine is unavailable")
 	}
-	n, err := a.Engine.Name(ctx, intent, "起点: "+*base+"。summaryは日本語で簡潔に。branchは短く。")
+	n, err := a.Engine.Name(ctx, intent, "Base: "+*base+". Keep summary concise in Japanese; branch short.")
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err = ValidBranch(n.Branch); err != nil {
 		return err
 	}
 	if strings.TrimSpace(n.Summary) == "" || strings.ContainsAny(n.Summary, "\x00\r\n\t") {
-		return errors.New("不正な作業要約")
+		return errors.New("invalid task summary")
 	}
-	if a.Repo.BranchExists(n.Branch) {
-		return errors.New("生成ブランチ名は既に存在します")
+	return a.createEntry(Entry{Branch: n.Branch, Summary: n.Summary, Base: *base, Target: *base}, before)
+}
+
+func (a *App) createEntry(e Entry, before string) error {
+	if err := a.operationContext().Err(); err != nil {
+		return err
+	}
+	if err := ValidBranch(e.Branch); err != nil {
+		return err
+	}
+	if a.Repo.BranchExists(e.Branch) {
+		return errors.New("generated branch name already exists")
 	}
 	trees, err := a.Repo.Worktrees()
 	if err != nil {
 		return err
 	}
 	if len(trees) == 0 {
-		return errors.New("worktreeがありません")
+		return errors.New("no worktrees")
 	}
 	parent := trees[0].Path + ".worktrees"
 	if err = os.Mkdir(parent, 0700); err != nil && !errors.Is(err, os.ErrExist) {
@@ -324,30 +364,33 @@ func (a *App) create(ctx context.Context, args []string) error {
 		return err
 	}
 	if real != parent {
-		return errors.New("保存先にsymlinkを含めることはできません")
+		return errors.New("destination must not contain symlinks")
 	}
-	path := filepath.Join(parent, strings.ReplaceAll(n.Branch, "/", "-"))
+	path := filepath.Join(parent, strings.ReplaceAll(e.Branch, "/", "-"))
 	if _, err = os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-		return errors.New("保存先が既に存在するか検証できません")
+		return errors.New("destination already exists or cannot be verified")
 	}
-	now, err := a.branchHEAD(*base)
+	now, err := a.branchHEAD(e.Base)
 	if err != nil {
 		return err
 	}
 	if now != before {
-		return errors.New("起点ブランチが変更されました。再実行してください")
+		return errors.New("base branch changed; run the command again")
 	}
-	e := Entry{Branch: n.Branch, Summary: n.Summary, Base: *base, Target: *base, Path: path}
-	s := &State{Kind: "new", Stage: "planned", Source: n.Branch, Target: *base, SourcePath: path, TargetHEAD: before, Entry: &e}
-	fmt.Fprintf(a.Out, "起点: %s\n生成名: %s\n要約: %s\n作成パス: %s\n", *base, n.Branch, n.Summary, path)
+	e.Path = path
+	s := &State{Kind: "new", Stage: "planned", Source: e.Branch, Target: e.Base, SourcePath: path, TargetHEAD: before, Entry: &e}
+	fmt.Fprintf(a.Out, "Base: %s\nGenerated name: %s\nSummary: %s\nCreation path: %s\n", e.Base, e.Branch, e.Summary, path)
 	if err = a.saveState(s); err != nil {
 		return err
 	}
 	return a.continueCreate(s)
 }
 func (a *App) continueCreate(s *State) error {
+	if err := a.operationContext().Err(); err != nil {
+		return err
+	}
 	if s.Entry == nil {
-		return errors.New("作成情報がありません")
+		return errors.New("creation details are missing")
 	}
 	e := *s.Entry
 	if err := ValidBranch(e.Branch); err != nil {
@@ -360,7 +403,7 @@ func (a *App) continueCreate(s *State) error {
 		return err
 	}
 	if !filepath.IsAbs(e.Path) || real != parent || filepath.Base(e.Path) != strings.ReplaceAll(e.Branch, "/", "-") {
-		return errors.New("保存先が変更されたか安全ではありません")
+		return errors.New("destination changed or is unsafe")
 	}
 	// Only the original planned path is used; never reuse an existing directory.
 	if s.Stage == "planned" {
@@ -370,10 +413,13 @@ func (a *App) continueCreate(s *State) error {
 				return err
 			}
 			if head != s.TargetHEAD {
-				return errors.New("起点が変更されています")
+				return errors.New("base changed")
 			}
 			if a.Repo.BranchExists(e.Branch) {
-				return errors.New("ブランチが既に存在します。自動復旧しません")
+				return errors.New("branch already exists; no automatic recovery")
+			}
+			if err := a.operationContext().Err(); err != nil {
+				return err
 			}
 			if _, err = a.Repo.Git(a.Repo.Root, "worktree", "add", "-b", e.Branch, "--", e.Path, s.TargetHEAD); err != nil {
 				return err
@@ -389,7 +435,7 @@ func (a *App) continueCreate(s *State) error {
 			return err
 		}
 		if head != s.TargetHEAD {
-			return errors.New("作成先HEADが変更されています")
+			return errors.New("destination HEAD changed")
 		}
 		s.Stage = "worktree-created"
 		if err = a.saveState(s); err != nil {
@@ -397,7 +443,10 @@ func (a *App) continueCreate(s *State) error {
 		}
 	}
 	if s.Stage != "worktree-created" {
-		return errors.New("不正な作成段階")
+		return errors.New("invalid creation stage")
+	}
+	if err := a.operationContext().Err(); err != nil {
+		return err
 	}
 	if err := a.verifyEntry(e); err != nil {
 		return err
@@ -414,17 +463,17 @@ func (a *App) continueCreate(s *State) error {
 	if err = a.saveState(s); err != nil {
 		return err
 	}
-	fmt.Fprintln(a.Out, "作成しました:", e.Path)
+	fmt.Fprintln(a.Out, "Created:", e.Path)
 	return nil
 }
 func (a *App) merge(ctx context.Context, args []string) error {
 	f := a.flags("merge")
-	target := f.String("target", "", "統合先ブランチ")
+	target := f.String("target", "", "Target branch")
 	if err := f.Parse(args); err != nil {
 		return err
 	}
 	if f.NArg() != 0 {
-		return errors.New("対象は一覧から選択してください")
+		return errors.New("select from the list")
 	}
 	e, err := a.selectEntry()
 	if err != nil {
@@ -434,7 +483,7 @@ func (a *App) merge(ctx context.Context, args []string) error {
 		*target = e.Target
 	}
 	if *target == e.Branch {
-		return errors.New("同じブランチへはマージできません")
+		return errors.New("cannot merge a branch into itself")
 	}
 	path, err := a.targetPath(*target)
 	if err != nil {
@@ -467,18 +516,24 @@ func (a *App) merge(ctx context.Context, args []string) error {
 		return err
 	}
 	s := &State{Kind: "merge", Stage: "planned", Source: e.Branch, Target: *target, SourcePath: e.Path, TargetPath: path, SourceHEAD: sourceHEAD, TargetHEAD: targetHEAD, Snapshot: snap}
-	fmt.Fprintf(a.Out, "対象: %s\n統合先: %s (%s)\n通常のGit mergeは競合マーカー等を作成する場合があります。\n", s.Source, s.Target, path)
+	fmt.Fprintf(a.Out, "Source: %s\nTarget: %s (%s)\nA normal Git merge may create conflict markers and other changes.\n", s.Source, s.Target, path)
 	if err = a.saveState(s); err != nil {
 		return err
 	}
 	return a.startMerge(ctx, s)
 }
 func (a *App) startMerge(ctx context.Context, s *State) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := a.checkMergeStart(s); err != nil {
 		return err
 	}
 	s.Stage = "merging"
 	if err := a.saveState(s); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	_, mergeErr := a.Repo.Git(s.TargetPath, "merge", "--no-edit", "--no-verify", "--no-gpg-sign", "--no-overwrite-ignore", s.SourceHEAD)
@@ -494,7 +549,7 @@ func (a *App) startMerge(ctx context.Context, s *State) error {
 		if err = a.saveState(s); err != nil {
 			return err
 		}
-		fmt.Fprintln(a.Out, "マージが完了しました（自動削除しません）")
+		fmt.Fprintln(a.Out, "Merge completed (no automatic deletion)")
 		return nil
 	}
 	s.Stage = "conflicted"
@@ -505,7 +560,7 @@ func (a *App) startMerge(ctx context.Context, s *State) error {
 	if err = a.saveState(s); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Out, "競合状態を保存しました。中止: git -C %q merge --abort または wsup abort\n", s.TargetPath)
+	fmt.Fprintf(a.Out, "Conflict state saved. To abort: git -C %q merge --abort or wsup abort\n", s.TargetPath)
 	return a.resolve(ctx, s)
 }
 func (a *App) checkMergeStart(s *State) error {
@@ -518,11 +573,11 @@ func (a *App) checkMergeStart(s *State) error {
 		return err
 	}
 	if source != s.SourceHEAD || target != s.TargetHEAD {
-		return errors.New("ブランチHEADが変更されました")
+		return errors.New("branch HEAD changed")
 	}
 	path, err := a.targetPath(s.Target)
 	if err != nil || path != s.TargetPath {
-		return errors.New("統合先worktreeが変更されました")
+		return errors.New("target worktree changed")
 	}
 	if err = a.Repo.Clean(s.SourcePath); err != nil {
 		return err
@@ -538,7 +593,7 @@ func (a *App) checkMergeStart(s *State) error {
 		return err
 	}
 	if snap != s.Snapshot {
-		return errors.New("統合先の状態が変更されました")
+		return errors.New("target state changed")
 	}
 	return nil
 }
@@ -555,13 +610,13 @@ func (a *App) remove() error {
 	if err = a.checkRemove(s); err != nil {
 		return err
 	}
-	fmt.Fprintf(a.Out, "削除パス: %s\nブランチ: %s\n統合先: %s（取り込み済み）\n", e.Path, e.Branch, e.Target)
-	yes, err := a.confirm("worktreeとブランチを削除しますか？")
+	fmt.Fprintf(a.Out, "Removal path: %s\nBranch: %s\nTarget: %s (already merged)\n", e.Path, e.Branch, e.Target)
+	yes, err := a.confirm("Remove the worktree and branch?")
 	if err != nil {
 		return err
 	}
 	if !yes {
-		return errors.New("削除を中止しました")
+		return errors.New("removal canceled")
 	}
 	if err = a.saveState(s); err != nil {
 		return err
@@ -570,26 +625,29 @@ func (a *App) remove() error {
 }
 func (a *App) checkRemove(s *State) error {
 	if s.Source == s.Target {
-		return errors.New("統合先自身は削除できません")
+		return errors.New("cannot remove the target branch itself")
 	}
 	head, err := a.branchHEAD(s.Source)
 	if err != nil {
 		return err
 	}
 	if head != s.SourceHEAD {
-		return errors.New("削除対象HEADが変更されました")
+		return errors.New("removal source HEAD changed")
 	}
 	if _, err = a.branchHEAD(s.Target); err != nil {
 		return err
 	}
 	if _, err = a.Repo.Git(a.Repo.Root, "merge-base", "--is-ancestor", s.SourceHEAD, "refs/heads/"+s.Target); err != nil {
-		return errors.New("記録された統合先に取り込み済みと確認できません")
+		return errors.New("cannot confirm the branch is merged into the recorded target")
 	}
 	return nil
 }
 func (a *App) continueRemove(s *State) error {
+	if err := a.operationContext().Err(); err != nil {
+		return err
+	}
 	if s.Entry == nil {
-		return errors.New("削除情報がありません")
+		return errors.New("removal details are missing")
 	}
 	if s.Stage == "planned" {
 		// Reconcile a crash after worktree removal but before saving its stage.
@@ -600,7 +658,7 @@ func (a *App) continueRemove(s *State) error {
 			}
 			for _, tree := range trees {
 				if tree.Path == s.SourcePath || tree.Branch == s.Source {
-					return errors.New("削除対象の登録が残るか別worktreeで使用されています")
+					return errors.New("removal source is still registered or in use by another worktree")
 				}
 			}
 			if err := a.checkRemove(s); err != nil {
@@ -633,7 +691,7 @@ func (a *App) continueRemove(s *State) error {
 			return err
 		}
 		if rel == "." || !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && rel != ".." {
-			return errors.New("現在のディレクトリを含むworktreeは削除できません")
+			return errors.New("cannot remove the worktree containing the current directory")
 		}
 		// Ignored files are also user data. Git's default remove can delete them.
 		ignored, err := gitRaw(s.SourcePath, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
@@ -641,7 +699,10 @@ func (a *App) continueRemove(s *State) error {
 			return err
 		}
 		if len(ignored) > 0 {
-			return errors.New("ignoredファイルが残っています。削除せず停止します")
+			return errors.New("ignored files remain; stopping without deletion")
+		}
+		if err := a.operationContext().Err(); err != nil {
+			return err
 		}
 		if _, err = a.Repo.Git(a.Repo.Root, "worktree", "remove", "--", s.SourcePath); err != nil {
 			return err
@@ -652,7 +713,10 @@ func (a *App) continueRemove(s *State) error {
 		}
 	}
 	if s.Stage != "worktree-removed" {
-		return errors.New("不正な削除段階")
+		return errors.New("invalid removal stage")
+	}
+	if err := a.operationContext().Err(); err != nil {
+		return err
 	}
 	if a.Repo.BranchExists(s.Source) {
 		if err := a.checkRemove(s); err != nil {
@@ -664,8 +728,11 @@ func (a *App) continueRemove(s *State) error {
 		}
 		for _, tree := range trees {
 			if tree.Branch == s.Source {
-				return errors.New("削除対象ブランチは別worktreeで使用されています")
+				return errors.New("branch to remove is in use by another worktree")
 			}
+		}
+		if err := a.operationContext().Err(); err != nil {
+			return err
 		}
 		// Delete only if the ref still points at the checked commit, never force-delete.
 		if _, err := a.Repo.Git(a.Repo.Root, "update-ref", "-d", "refs/heads/"+s.Source, s.SourceHEAD); err != nil {
@@ -684,7 +751,7 @@ func (a *App) continueRemove(s *State) error {
 	if err = a.saveState(s); err != nil {
 		return err
 	}
-	fmt.Fprintln(a.Out, "削除しました")
+	fmt.Fprintln(a.Out, "Removed")
 	return nil
 }
 func (a *App) recover(ctx context.Context, abort bool) error {
@@ -693,16 +760,16 @@ func (a *App) recover(ctx context.Context, abort bool) error {
 		return err
 	}
 	if s == nil || s.Stage == "completed" || s.Stage == "aborted" {
-		return errors.New("中断操作はありません")
+		return errors.New("no interrupted operation")
 	}
-	fmt.Fprintf(a.Out, "中断操作: %s / %s\n対象: %s -> %s\n", s.Kind, s.Stage, s.Source, s.Target)
+	fmt.Fprintf(a.Out, "Interrupted operation: %s / %s\nBranches: %s -> %s\n", s.Kind, s.Stage, s.Source, s.Target)
 	if abort {
-		yes, err := a.confirm("保存した操作を中止しますか？（作成済みworktreeは保持します）")
+		yes, err := a.confirm("Abort the saved operation? (Existing worktrees are kept)")
 		if err != nil {
 			return err
 		}
 		if !yes {
-			return errors.New("中止しませんでした")
+			return errors.New("operation not aborted")
 		}
 		if s.Kind == "merge" {
 			p, err := a.Repo.gitPath(s.TargetPath, "MERGE_HEAD")
@@ -723,12 +790,12 @@ func (a *App) recover(ctx context.Context, abort bool) error {
 		s.Stage = "aborted"
 		return a.saveState(s)
 	}
-	yes, err := a.confirm("現在の状態を再検証して再開しますか？")
+	yes, err := a.confirm("Revalidate the current state and resume?")
 	if err != nil {
 		return err
 	}
 	if !yes {
-		return errors.New("再開しませんでした")
+		return errors.New("operation not resumed")
 	}
 	switch s.Kind {
 	case "new":
@@ -757,11 +824,11 @@ func (a *App) recover(ctx context.Context, abort bool) error {
 					return a.saveState(s)
 				}
 			}
-			return errors.New("進行中のマージがありません。状態を確認しwsup abortで記録を中止してください")
+			return errors.New("no merge in progress; check the state and clear the saved operation with wsup abort")
 		} else if err != nil {
 			return err
 		}
 		return a.resolve(ctx, s)
 	}
-	return errors.New("不明な中断操作")
+	return errors.New("unknown interrupted operation")
 }

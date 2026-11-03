@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unicode/utf8"
 )
 
@@ -381,7 +382,7 @@ func (a *App) resolve(ctx context.Context, s *State) error {
 	if err = a.conflictUnchanged(s, snapshot); err != nil {
 		return err
 	}
-	yes, err := a.confirm("この差分を適用しますか？")
+	yes, err := a.confirm("Apply this patch?")
 	if err != nil {
 		return err
 	}
@@ -427,10 +428,23 @@ func (a *App) conflictRunTests(s *State, argv []string) error {
 	if err := a.conflictUnchanged(s, s.Snapshot); err != nil {
 		return err
 	}
-	cmd := exec.Command(argv[0], argv[1:]...)
+	ctx := a.operationContext()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Dir = s.TargetPath
 	cmd.Stdout, cmd.Stderr = a.Out, a.Out
 	runErr := cmd.Run()
+	if err := ctx.Err(); err != nil {
+		runErr = errors.Join(runErr, err)
+	}
 	unchangedErr := a.conflictUnchanged(s, s.Snapshot)
 	if runErr != nil || unchangedErr != nil {
 		s.Stage = "test-failed"
@@ -442,6 +456,9 @@ func (a *App) conflictRunTests(s *State, argv []string) error {
 // finishMerge always obtains fresh approval, including on a resumed test failure.
 // It commits only a pending merge, never an ordinary dirty worktree.
 func (a *App) finishMerge(s *State) error {
+	if err := a.operationContext().Err(); err != nil {
+		return err
+	}
 	if err := a.conflictHeads(s); err != nil {
 		return err
 	}
@@ -478,9 +495,9 @@ func (a *App) finishMerge(s *State) error {
 	if _, err = fmt.Fprintf(a.Out, "Merge diff:\n%s\n", diff); err != nil {
 		return err
 	}
-	prompt := "テストを実行してマージを完了しますか？"
+	prompt := "Run tests and complete the merge?"
 	if len(config.Test) == 0 {
-		prompt = "未検証: テスト設定がありません。マージを完了しますか？"
+		prompt = "Unverified: no tests configured. Complete the merge?"
 	}
 	yes, err := a.confirm(prompt)
 	if err != nil {
@@ -500,6 +517,9 @@ func (a *App) finishMerge(s *State) error {
 	if err = a.conflictUnchanged(s, s.Snapshot); err != nil {
 		return err
 	}
+	if err := a.operationContext().Err(); err != nil {
+		return err
+	}
 	mergeHead, err := a.Repo.gitPath(s.TargetPath, "MERGE_HEAD")
 	if err != nil {
 		return err
@@ -511,6 +531,9 @@ func (a *App) finishMerge(s *State) error {
 		}
 		if strings.TrimSpace(string(data)) != s.SourceHEAD {
 			return errors.New("MERGE_HEAD does not match the approved source")
+		}
+		if err := a.operationContext().Err(); err != nil {
+			return err
 		}
 		if _, err = gitInput(s.TargetPath, "", "commit", "--no-edit"); err != nil {
 			return err

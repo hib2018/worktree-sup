@@ -11,11 +11,13 @@ import (
 )
 
 type Entry struct {
-	Branch  string `json:"branch"`
-	Summary string `json:"summary"`
-	Base    string `json:"base"`
-	Target  string `json:"target"`
-	Path    string `json:"path"`
+	Branch      string `json:"branch"`
+	Summary     string `json:"summary"`
+	Base        string `json:"base"`
+	Target      string `json:"target"`
+	Path        string `json:"path"`
+	IssueNumber int    `json:"issue_number,omitempty"`
+	IssueURL    string `json:"issue_url,omitempty"`
 }
 type Metadata struct {
 	Entries map[string]Entry `json:"entries"`
@@ -150,7 +152,7 @@ func (a *App) idle() error {
 		return err
 	}
 	if s != nil && s.Stage != "completed" && s.Stage != "aborted" {
-		return fmt.Errorf("中断操作があります (%s/%s)。wsup resume または wsup abort を実行してください", s.Kind, s.Stage)
+		return fmt.Errorf("an interrupted operation exists (%s/%s); run wsup resume or wsup abort", s.Kind, s.Stage)
 	}
 	return nil
 }

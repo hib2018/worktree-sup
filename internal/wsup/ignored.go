@@ -58,7 +58,7 @@ func (a *App) protectIgnored(s *State) error {
 			return err
 		}
 		if !ok {
-			return errors.New("ignoredファイルが検証中に変更されました")
+			return errors.New("ignored file changed during validation")
 		}
 		occupiedIDs[id] = true
 		for i := strings.LastIndexByte(p, '/'); i >= 0; i = strings.LastIndexByte(p, '/') {
@@ -69,7 +69,7 @@ func (a *App) protectIgnored(s *State) error {
 				return err
 			}
 			if !ok {
-				return errors.New("ignored親パスが検証中に変更されました")
+				return errors.New("ignored parent path changed during validation")
 			}
 			parentIDs[id] = true
 		}
@@ -85,7 +85,7 @@ func (a *App) protectIgnored(s *State) error {
 				return err
 			}
 			if occupied[p] || exists && occupiedIDs[id] || p == name && (parents[p] || exists && parentIDs[id]) {
-				return fmt.Errorf("取り込み先のignoredファイルと衝突します: %s", name)
+				return fmt.Errorf("incoming path collides with an ignored file: %s", name)
 			}
 			i := strings.LastIndexByte(p, '/')
 			if i < 0 {

@@ -122,7 +122,7 @@ func TestAppNewListMergeRemove(t *testing.T) {
 					t.Errorf("list missing %q: %s", text, out)
 				}
 			}
-			// Merge selects the managed entry; remove additionally requires literal yes.
+			// Merge selects the managed entry; remove additionally requires literal y.
 			appTestOK(t, a, "1\n", "merge", "--target", "main")
 			appTestState(t, a, "merge", "completed")
 			if mode == "fast-forward" {
@@ -135,7 +135,7 @@ func TestAppNewListMergeRemove(t *testing.T) {
 			if _, err := os.Stat(e.Path); err != nil || !a.Repo.BranchExists(e.Branch) {
 				t.Fatalf("merge removed source: %v", err)
 			}
-			appTestOK(t, a, "1\nyes\n", "remove")
+			appTestOK(t, a, "1\ny\n", "remove")
 			appTestState(t, a, "remove", "completed")
 			if _, err := os.Stat(e.Path); !errors.Is(err, os.ErrNotExist) || a.Repo.BranchExists(e.Branch) {
 				t.Fatalf("source not removed: %v", err)
@@ -276,12 +276,12 @@ func TestAppMergeRejectsDirtySourceAndTarget(t *testing.T) {
 }
 
 func TestAppSelectionAndExplicitRemovalApproval(t *testing.T) {
-	for _, input := range []string{"0\n", "2\n", "no\n", "", "1\nno\n", "1\ny\n", "1\nYES\n", "1\nyes"} {
+	for _, input := range []string{"0\n", "2\n", "no\n", "", "1\nN\n", "1\nyes\n", "1\nYES\n", "1\ny"} {
 		t.Run(strings.ReplaceAll(input, "\n", "_"), func(t *testing.T) {
 			a, _, _ := appTestFixture(t)
-			e := appTestCreate(t, a) // Already an ancestor of main; safe to remove only with yes.
+			e := appTestCreate(t, a) // Already an ancestor of main; safe to remove only with y.
 			if err := appTestExecute(a, input, "remove"); err == nil {
-				t.Fatal("removed without valid selection and explicit yes")
+				t.Fatal("removed without valid selection and explicit y")
 			}
 			if _, err := os.Stat(e.Path); err != nil || !a.Repo.BranchExists(e.Branch) {
 				t.Fatalf("lost source: %v", err)
@@ -307,7 +307,7 @@ func TestAppRemoveRefusesUnmergedAndIgnoredData(t *testing.T) {
 				want = "ignored user data\n"
 				writeTestFile(t, file, want)
 			}
-			err := appTestExecute(a, "1\nyes\n", "remove")
+			err := appTestExecute(a, "1\ny\n", "remove")
 			if err == nil {
 				t.Fatal("unsafe removal accepted")
 			}
@@ -405,11 +405,11 @@ func TestAppInterruptedCreateRecovery(t *testing.T) {
 			if err := appTestExecute(a, "", "new", "--base", "main", "another"); err == nil {
 				t.Fatal("did not block pending operation")
 			}
-			if err := appTestExecute(a, "no\n", "resume"); err == nil {
+			if err := appTestExecute(a, "N\n", "resume"); err == nil {
 				t.Fatal("resumed without approval")
 			}
 			appTestState(t, a, "new", s.Stage)
-			appTestOK(t, a, "yes\n", "resume")
+			appTestOK(t, a, "y\n", "resume")
 			appTestState(t, a, "new", "completed")
 			if got := appTestEntry(t, a, s.Source); got != *s.Entry {
 				t.Fatalf("recovered entry: %+v", got)
@@ -417,7 +417,7 @@ func TestAppInterruptedCreateRecovery(t *testing.T) {
 			if engine.names != 0 {
 				t.Fatal("resume regenerated naming")
 			}
-			if err := appTestExecute(a, "yes\n", "resume"); err == nil {
+			if err := appTestExecute(a, "y\n", "resume"); err == nil {
 				t.Fatal("resumed completed operation")
 			}
 		})
@@ -428,7 +428,7 @@ func TestAppInterruptedCreateRejectsChangedBase(t *testing.T) {
 	a, _, _ := appTestFixture(t)
 	s := appTestPlannedCreate(t, a)
 	testGit(t, a.Repo.Root, "commit", "--allow-empty", "-m", "base advanced")
-	if err := appTestExecute(a, "yes\n", "resume"); err == nil {
+	if err := appTestExecute(a, "y\n", "resume"); err == nil {
 		t.Fatal("resumed against changed base")
 	}
 	if a.Repo.BranchExists(s.Source) {
@@ -455,10 +455,10 @@ func TestAppInterruptedRemoveRecovery(t *testing.T) {
 			if err := a.saveState(s); err != nil {
 				t.Fatal(err)
 			}
-			if err := appTestExecute(a, "no\n", "resume"); err == nil {
+			if err := appTestExecute(a, "N\n", "resume"); err == nil {
 				t.Fatal("resumed without approval")
 			}
-			appTestOK(t, a, "yes\n", "resume")
+			appTestOK(t, a, "y\n", "resume")
 			appTestState(t, a, "remove", "completed")
 			if a.Repo.BranchExists(e.Branch) {
 				t.Fatal("branch survived removal")
@@ -503,7 +503,7 @@ func TestAppResumedRemoveRefusesCheckedOutSource(t *testing.T) {
 				t.Fatal(err)
 			}
 			trees := testGit(t, a.Repo.Root, "worktree", "list", "--porcelain")
-			err = appTestExecute(a, "yes\n", "resume")
+			err = appTestExecute(a, "y\n", "resume")
 			if err == nil || !strings.Contains(err.Error(), "worktree") {
 				t.Fatalf("resume did not refuse a checked-out source: %v", err)
 			}
@@ -556,7 +556,7 @@ func TestAppResumedCreateRejectsReplacedParent(t *testing.T) {
 			writeTestFile(t, filepath.Join(redirected, "precious"), "outside user data\n")
 			before := appTestDiskImage(t, redirected)
 			trees := testGit(t, a.Repo.Root, "worktree", "list", "--porcelain")
-			err := appTestExecute(a, "yes\n", "resume")
+			err := appTestExecute(a, "y\n", "resume")
 			if err == nil || !strings.Contains(err.Error(), "destination") {
 				t.Fatalf("resume did not reject a noncanonical parent: %v", err)
 			}
@@ -593,11 +593,11 @@ func TestAppAbortPreservesCreatedWorktree(t *testing.T) {
 			if err := a.saveState(s); err != nil {
 				t.Fatal(err)
 			}
-			if err := appTestExecute(a, "no\n", "abort"); err == nil {
+			if err := appTestExecute(a, "N\n", "abort"); err == nil {
 				t.Fatal("aborted without approval")
 			}
 			appTestState(t, a, kind, s.Stage)
-			appTestOK(t, a, "yes\n", "abort")
+			appTestOK(t, a, "y\n", "abort")
 			appTestState(t, a, kind, "aborted")
 			if _, err := os.Stat(e.Path); err != nil || !a.Repo.BranchExists(e.Branch) {
 				t.Fatalf("abort deleted work: %v", err)

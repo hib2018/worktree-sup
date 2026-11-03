@@ -195,7 +195,7 @@ func TestIssueCancellationAndRecovery(t *testing.T) {
 			a.Out = out
 			if stage == "before-create" {
 				appTestState(t, a, "new", "planned")
-				appTestOK(t, a, "yes\n", "resume")
+				appTestOK(t, a, "y\n", "resume")
 			}
 			if err := a.verifyEntry(appTestEntry(t, a, "issue-1")); err != nil {
 				t.Fatal(err)
@@ -219,7 +219,7 @@ func TestIssueAbortKeepsResources(t *testing.T) {
 	}
 	before := cancelSnapshot(t, a)
 	a.Out = out
-	appTestOK(t, a, "yes\n", "abort")
+	appTestOK(t, a, "y\n", "abort")
 	after := cancelSnapshot(t, a)
 	delete(before, "operation.json")
 	delete(after, "operation.json")

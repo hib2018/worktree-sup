@@ -67,7 +67,7 @@ func conflictFixture(t *testing.T) (*App, *State, *conflictFakeEngine, *bytes.Bu
 		return Resolution{Intent: "resolve intent", Plan: "resolve plan", Patch: patch}, nil
 	}
 	out := &bytes.Buffer{}
-	a := &App{Repo: r, Engine: engine, In: bufio.NewReader(strings.NewReader("yes\nyes\n")), Out: out}
+	a := &App{Repo: r, Engine: engine, In: bufio.NewReader(strings.NewReader("y\ny\n")), Out: out}
 	return a, s, engine, out
 }
 
@@ -96,7 +96,7 @@ func TestConflictResolveAndFinish(t *testing.T) {
 func TestConflictDeclineAndFreshResolution(t *testing.T) {
 	a, s, e, _ := conflictFixture(t)
 	before := snapshotTest(t, a.Repo)
-	a.In = bufio.NewReader(strings.NewReader("no\n"))
+	a.In = bufio.NewReader(strings.NewReader("N\n"))
 	if err := a.resolve(context.Background(), s); err == nil || !strings.Contains(err.Error(), "declined") {
 		t.Fatalf("decline: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestConflictDeclineAndFreshResolution(t *testing.T) {
 	if after := snapshotTest(t, a.Repo); after != before {
 		t.Fatal("decline mutated worktree/index")
 	}
-	a.In = bufio.NewReader(strings.NewReader("no\n"))
+	a.In = bufio.NewReader(strings.NewReader("N\n"))
 	_ = a.resolve(context.Background(), s)
 	if e.calls != 2 {
 		t.Fatal("reused cached resolution")
@@ -152,7 +152,7 @@ func (r *conflictMutatingReader) Read(p []byte) (int, error) {
 }
 func TestConflictApprovalMutationRejected(t *testing.T) {
 	a, s, _, _ := conflictFixture(t)
-	a.In = bufio.NewReader(&conflictMutatingReader{action: func() { writeTestFile(t, filepath.Join(a.Repo.Root, "tracked"), "changed during approval\n") }, text: strings.NewReader("yes\n")})
+	a.In = bufio.NewReader(&conflictMutatingReader{action: func() { writeTestFile(t, filepath.Join(a.Repo.Root, "tracked"), "changed during approval\n") }, text: strings.NewReader("y\n")})
 	if err := a.resolve(context.Background(), s); err == nil || !strings.Contains(err.Error(), "snapshot changed") {
 		t.Fatalf("approval mutation: %v", err)
 	}
@@ -238,19 +238,19 @@ func TestConflictContextLimit(t *testing.T) {
 func TestConflictResolvedResumeRequiresSnapshotAndApproval(t *testing.T) {
 	a, s, _, _ := conflictFixture(t)
 	// Approve applying, decline finishing, then resume: no cached approval.
-	a.In = bufio.NewReader(strings.NewReader("yes\nno\n"))
+	a.In = bufio.NewReader(strings.NewReader("y\nN\n"))
 	if err := a.resolve(context.Background(), s); err == nil {
 		t.Fatal("expected finish decline")
 	}
 	if s.Stage != "resolved" {
 		t.Fatal(s.Stage)
 	}
-	a.In = bufio.NewReader(strings.NewReader("no\n"))
+	a.In = bufio.NewReader(strings.NewReader("N\n"))
 	if err := a.resolve(context.Background(), s); err == nil {
 		t.Fatal("resume reused approval")
 	}
 	writeTestFile(t, filepath.Join(a.Repo.Root, "tracked"), "manual correction\n")
-	a.In = bufio.NewReader(strings.NewReader("yes\n"))
+	a.In = bufio.NewReader(strings.NewReader("y\n"))
 	if err := a.resolve(context.Background(), s); err == nil {
 		t.Fatal("accepted corrected resolved state")
 	}
@@ -305,7 +305,7 @@ func TestConflictTestCommandGuards(t *testing.T) {
 	for _, mode := range []string{"fail", "mutate-file", "mutate-index", "mutate-source", "remove-merge-head", "literal; touch must-not-exist"} {
 		t.Run(mode, func(t *testing.T) {
 			a, s, _, out := conflictFixture(t)
-			a.In = bufio.NewReader(strings.NewReader("yes\nno\n"))
+			a.In = bufio.NewReader(strings.NewReader("y\nN\n"))
 			if err := a.resolve(context.Background(), s); err == nil || s.Stage != "resolved" {
 				t.Fatalf("prepare resolved state: %s %v", s.Stage, err)
 			}
@@ -349,7 +349,7 @@ func TestConflictCleanCompletionDoesNotCommit(t *testing.T) {
 	r := testRepo(t)
 	head := testGit(t, r.Root, "rev-parse", "HEAD")
 	s := &State{Source: "main", Target: "main", SourcePath: r.Root, TargetPath: r.Root, SourceHEAD: head, TargetHEAD: head}
-	a := &App{Repo: r, In: bufio.NewReader(strings.NewReader("yes\n")), Out: &bytes.Buffer{}}
+	a := &App{Repo: r, In: bufio.NewReader(strings.NewReader("y\n")), Out: &bytes.Buffer{}}
 	if err := a.finishMerge(s); err != nil {
 		t.Fatal(err)
 	}

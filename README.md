@@ -20,7 +20,7 @@ wsup uses your saved fx model/provider settings and login, including Codex subsc
 
 ## Usage
 
-Run inside a Git repository. Submit interactive input with Enter. Approval requires an explicit `yes`.
+Run inside a Git repository. Submit interactive input with Enter. Confirmation prompts use `[y/N]`: enter `y` to approve or `N` to decline. Empty input also declines; only `y` approves.
 
 Press **Ctrl+C** or **Esc** at any input, selection, or confirmation prompt to cancel immediately, without Enter. Arrow keys do not cancel. Ctrl+C also interrupts model requests and configured test commands. Cancellation exits with status 130 and preserves any existing changes or pending merge rather than automatically rolling them back. Check `wsup status`, then use `wsup resume` or `wsup abort` as needed.
 

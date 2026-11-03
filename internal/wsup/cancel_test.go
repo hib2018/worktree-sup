@@ -246,7 +246,7 @@ func (w *cancelCommandOutput) Write(p []byte) (int, error) {
 func TestCancelAppConfiguredTests(t *testing.T) {
 	a, s, engine, _ := conflictFixture(t)
 	// Resolve once with the fake model, but decline completion for now.
-	a.In = bufio.NewReader(strings.NewReader("yes\nno\n"))
+	a.In = bufio.NewReader(strings.NewReader("y\nN\n"))
 	if err := a.resolve(context.Background(), s); err == nil || s.Stage != "resolved" {
 		t.Fatalf("prepare resolved state: stage=%s err=%v", s.Stage, err)
 	}
@@ -260,7 +260,7 @@ func TestCancelAppConfiguredTests(t *testing.T) {
 	defer cancel()
 	out := &cancelCommandOutput{ready: make(chan int, 1), cancel: cancel}
 	a.Out = out
-	a.In = bufio.NewReader(strings.NewReader("yes\nyes\n"))
+	a.In = bufio.NewReader(strings.NewReader("y\ny\n"))
 	result := make(chan error, 1)
 	go func() { result <- a.Execute(ctx, []string{"resume"}) }()
 	select {

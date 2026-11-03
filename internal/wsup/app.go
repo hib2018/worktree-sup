@@ -153,8 +153,8 @@ func (a *App) operationContext() context.Context {
 	return context.Background()
 }
 func (a *App) confirm(prompt string) (bool, error) {
-	s, err := a.ask(prompt + " [yes/no]")
-	return s == "yes", err
+	s, err := a.ask(prompt + " [y/N]")
+	return s == "y", err
 }
 func (a *App) flags(name string) *flag.FlagSet {
 	f := flag.NewFlagSet(name, flag.ContinueOnError)

@@ -7,10 +7,12 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"golang.org/x/term"
 )
 
-// Display terminal cells rather than UTF-8 bytes so Japanese text aligns with
-// the borders. Ambiguous-width characters use the usual one-cell convention.
+// Display terminal cells rather than UTF-8 bytes so Japanese columns align.
+// Ambiguous-width characters use the usual one-cell convention.
 func cellWidth(text string) int {
 	width := 0
 	for _, r := range text {
@@ -44,17 +46,40 @@ func tableCell(text string) string {
 	return b.String()
 }
 
+func clipCell(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if cellWidth(text) <= width {
+		return text
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range text {
+		w := cellWidth(string(r))
+		if used+w > width-1 {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	return b.String() + "…"
+}
+
 func writeTable(out io.Writer, rows [][]string) error {
-	bold := false
+	bold, columns := false, 0
 	if f, ok := out.(*os.File); ok {
 		info, err := f.Stat()
 		_, noColor := os.LookupEnv("NO_COLOR")
 		bold = err == nil && info.Mode()&os.ModeCharDevice != 0 && !noColor && os.Getenv("TERM") != "dumb"
+		if width, _, err := term.GetSize(int(f.Fd())); err == nil && width > 0 {
+			columns = width
+		}
 	}
-	return writeTableStyled(out, rows, bold)
+	return writeTableStyled(out, rows, bold, columns)
 }
 
-func writeTableStyled(out io.Writer, rows [][]string, bold bool) error {
+func writeTableStyled(out io.Writer, rows [][]string, bold bool, columns int) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -72,9 +97,45 @@ func writeTableStyled(out io.Writer, rows [][]string, bold bool) error {
 			}
 		}
 	}
+	gap := 2
+	if columns > 0 && len(widths) > 1 {
+		gap = min(gap, max(0, (columns-len(widths))/(len(widths)-1)))
+	}
+	total := gap * max(0, len(widths)-1)
+	minimums := make([]int, len(widths))
+	for j, width := range widths {
+		total += width
+		minimums[j] = cellWidth(cells[0][j])
+	}
+	if columns > 0 {
+		// Shrink the widest columns first; keep complete headings when possible.
+		for _, floors := range [][]int{minimums, make([]int, len(widths))} {
+			for total > columns {
+				widest := -1
+				for j, width := range widths {
+					if width > floors[j] && (widest < 0 || width > widths[widest]) {
+						widest = j
+					}
+				}
+				if widest < 0 {
+					break
+				}
+				widths[widest]--
+				total--
+			}
+		}
+	}
+	lastColumn := len(widths) - 1
+	for lastColumn >= 0 && widths[lastColumn] == 0 {
+		lastColumn--
+	}
 	var b strings.Builder
 	for i, row := range cells {
 		for j, cell := range row {
+			if widths[j] == 0 {
+				continue
+			}
+			cell = clipCell(cell, widths[j])
 			if i == 0 && bold {
 				b.WriteString("\x1b[1m")
 			}
@@ -82,20 +143,13 @@ func writeTableStyled(out io.Writer, rows [][]string, bold bool) error {
 			if i == 0 && bold {
 				b.WriteString("\x1b[22m")
 			}
-			if j < len(row)-1 {
-				b.WriteString(strings.Repeat(" ", widths[j]-cellWidth(cell)+2))
+			if j < lastColumn {
+				b.WriteString(strings.Repeat(" ", widths[j]-cellWidth(cell)+gap))
 			}
 		}
 		b.WriteByte('\n')
 		if i == 0 {
-			width := 0
-			for _, w := range widths {
-				width += w
-			}
-			if len(widths) > 1 {
-				width += 2 * (len(widths) - 1)
-			}
-			b.WriteString(strings.Repeat("─", width))
+			b.WriteString(strings.Repeat("─", total))
 			b.WriteByte('\n')
 		}
 	}

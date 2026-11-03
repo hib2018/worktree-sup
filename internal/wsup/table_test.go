@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -33,7 +34,7 @@ func TestWriteTable(t *testing.T) {
 
 func TestTableBoldHeadersOnly(t *testing.T) {
 	var out bytes.Buffer
-	if err := writeTableStyled(&out, [][]string{{"BRANCH", "SUMMARY"}, {"main", "要約"}}, true); err != nil {
+	if err := writeTableStyled(&out, [][]string{{"BRANCH", "SUMMARY"}, {"main", "要約"}}, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	want := "\x1b[1mBRANCH\x1b[22m  \x1b[1mSUMMARY\x1b[22m\n" + strings.Repeat("─", 15) + "\nmain    要約\n"
@@ -46,6 +47,75 @@ func TestTableBoldHeadersOnly(t *testing.T) {
 	}
 	if strings.Contains(plain.String(), "\x1b") {
 		t.Fatal("non-terminal output contains ANSI escapes")
+	}
+}
+
+func TestClipCell(t *testing.T) {
+	for _, tc := range []struct {
+		text  string
+		width int
+		want  string
+	}{
+		{"abcdef", 0, ""}, {"abcdef", 1, "…"}, {"abcdef", 4, "abc…"},
+		{"日本語", 3, "日…"}, {"日本語", 2, "…"}, {"日本語", 6, "日本語"},
+		{"e\u0301abcdef", 2, "e\u0301…"}, {"e\u0301", 1, "e\u0301"}, {"🙂abc", 3, "🙂…"},
+	} {
+		if got := clipCell(tc.text, tc.width); got != tc.want {
+			t.Errorf("clipCell(%q, %d) = %q, want %q", tc.text, tc.width, got, tc.want)
+		}
+	}
+}
+
+func TestTableFitsScreen(t *testing.T) {
+	rows := [][]string{
+		{"BRANCH", "SUMMARY", "PATH", "STATE"},
+		{"feature/" + strings.Repeat("long-", 12), strings.Repeat("日本語", 40), "../" + strings.Repeat("directory/", 12), "dirty / operation in progress / unreadable"},
+		{"main", "e\u0301", ".", "clean"},
+	}
+	for _, width := range []int{1, 2, 3, 4, 6, 10, 20, 28, 40, 60, 80, 120, 200} {
+		t.Run(strconv.Itoa(width), func(t *testing.T) {
+			for _, bold := range []bool{false, true} {
+				var out bytes.Buffer
+				if err := writeTableStyled(&out, rows, bold, width); err != nil {
+					t.Fatal(err)
+				}
+				plain := strings.NewReplacer("\x1b[1m", "", "\x1b[22m", "").Replace(out.String())
+				lines := strings.Split(strings.TrimSuffix(plain, "\n"), "\n")
+				if len(lines) != len(rows)+1 {
+					t.Fatalf("unexpected rows: %q", plain)
+				}
+				for _, line := range lines {
+					if cells := cellWidth(line); cells > width {
+						t.Errorf("line has %d cells, screen has %d: %q", cells, width, line)
+					}
+					if strings.TrimRight(line, " ") != line {
+						t.Errorf("trailing spaces: %q", line)
+					}
+				}
+				if width >= 28 {
+					for _, header := range rows[0] {
+						if !strings.Contains(lines[0], header) {
+							t.Errorf("header lost: %q", lines[0])
+						}
+					}
+				}
+				if !strings.Contains(plain, "…") {
+					t.Fatal("missing truncation marker")
+				}
+				if strings.ContainsAny(plain, "│┌┬┐├┼┤└┴┘") {
+					t.Fatal("unexpected borders")
+				}
+			}
+		})
+	}
+	var full bytes.Buffer
+	if err := writeTable(&full, rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range rows[1] {
+		if !strings.Contains(full.String(), value) {
+			t.Errorf("nonterminal output lost %q", value)
+		}
 	}
 }
 
@@ -111,7 +181,7 @@ func TestListPathsRelativeToPrimaryWorktree(t *testing.T) {
 			if strings.ContainsAny(text, "│┌┬┐├┼┤└┴┘") {
 				t.Fatal("unexpected table borders")
 			}
-			for _, want := range []string{"─", "未登録", "(detached)"} {
+			for _, want := range []string{"─", "unregistered", "(detached)"} {
 				if !strings.Contains(text, want) {
 					t.Errorf("missing %q", want)
 				}

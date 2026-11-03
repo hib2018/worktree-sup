@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -36,10 +37,12 @@ type Engine interface {
 // FX runs a native fx executable under macOS sandbox-exec. Other platforms fail
 // closed. DenyPaths should include every worktree root and the Git common dir;
 // the current directory is also denied. Paths must exist (symlinks are resolved).
-// Only OS runtime files, the executable, and a disposable directory are readable.
-// HOME/XDG config and the environment are isolated: no user fx config, skills,
-// MCP servers, or credentials are copied. Only the API keys listed in fxEnv are
-// forwarded. A missing usable provider credential therefore fails, not falls back.
+// In addition to OS runtime files, the executable, and a disposable directory,
+// only selected ~/.fx settings/auth files are shared. Settings are read-only;
+// auth files, coordination locks, and bounded refresh staging files are writable.
+// HOME identifies the real user, but does not grant access to their home tree,
+// skills, or separate MCP files. Saved settings may configure remote services.
+// Cwd/XDG/TMP remain isolated; only the API keys listed in fxEnv are forwarded.
 //
 // This is not complete tool isolation: network access is necessary and permits
 // exfiltration of supplied context/API keys and remote side effects. Trust the
@@ -206,7 +209,101 @@ func sandboxQuote(path string) (string, error) {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(path) + `"`, nil
 }
 
-func fxProfile(binary, dir string, denied []string) (string, error) {
+var fxSharedFiles = []string{
+	"settings.json", "settings.lock", "auth.json", "auth.lock",
+	"chatgpt-auth.json", "chatgpt-auth.lock", "grok-auth.json", "grok-auth.lock",
+}
+
+// shortcut: only these direct-child staging names are supported; revisit if fx
+// changes its refresh writer. Never permit settings.json.tmp.* or subdirectories.
+const fxStagePattern = `(\.tmp\.|(auth|chatgpt-auth|grok-auth)\.json\.tmp\.)[^/]+`
+
+func fxSharedProfile(home string, denied []string) (string, error) {
+	canonical, err := canonicalFXPath(home)
+	if err != nil || canonical != home {
+		return "", errors.New("sandbox shared HOME must be canonical")
+	}
+	config := filepath.Join(home, ".fx")
+	q, err := sandboxQuote(config)
+	if err != nil {
+		return "", err
+	}
+	for _, path := range denied {
+		// Reject overlap in either direction, including repositories inside .fx.
+		if config == path || strings.HasPrefix(config, path+"/") || strings.HasPrefix(path, config+"/") || path == "/" {
+			return "", errors.New("sandbox shared fx configuration overlaps a denied path")
+		}
+	}
+	// fx opens HOME and .fx as directories before reading individual files.
+	// Directory literals permit discovery, never reads of arbitrary descendants.
+	homeQuote, err := sandboxQuote(home)
+	if err != nil {
+		return "", err
+	}
+	profile := "(allow file-read-data (literal " + homeQuote + ") (literal " + q + "))\n"
+	profile += "(allow file-read-metadata (literal " + q + "))\n"
+	// fx enforces private credential-directory permissions at startup.
+	profile += "(allow file-write-mode (literal " + q + "))\n"
+	for parent := home; parent != "/"; parent = filepath.Dir(parent) {
+		parentQuote, err := sandboxQuote(parent)
+		if err != nil {
+			return "", err
+		}
+		profile += "(allow file-read-metadata (literal " + parentQuote + "))\n"
+	}
+	info, err := os.Lstat(config)
+	if errors.Is(err, os.ErrNotExist) {
+		return profile, nil // API-key-only use does not require saved configuration.
+	}
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", errors.New("sandbox shared .fx must be a real directory, not a symlink")
+	}
+	for _, name := range fxSharedFiles {
+		path := filepath.Join(config, name)
+		info, err := os.Lstat(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		if err == nil && !info.Mode().IsRegular() {
+			return "", errors.New("sandbox shared fx files must be regular files, not symlinks")
+		}
+		q, err := sandboxQuote(path)
+		if err != nil {
+			return "", err
+		}
+		profile += "(allow file-read* (literal " + q + "))\n"
+		if name != "settings.json" {
+			profile += "(allow file-write* (literal " + q + "))\n"
+		}
+	}
+	stage := regexp.MustCompile("^" + fxStagePattern + "$")
+	entries, err := os.ReadDir(config)
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range entries {
+		if stage.MatchString(entry.Name()) {
+			info, err := entry.Info()
+			if err != nil || !info.Mode().IsRegular() {
+				return "", errors.New("sandbox refresh staging files must be regular files, not symlinks")
+			}
+		}
+	}
+	// Use an ordinary SBPL string, not a #"..." regex literal: the latter
+	// does not use string-literal escaping for quotes/backslashes in HOME.
+	r, err := sandboxQuote(regexp.QuoteMeta(config) + "/" + fxStagePattern)
+	if err != nil {
+		return "", err
+	}
+	filter := "(regex \"^" + r[1:len(r)-1] + "$\")"
+	return profile + "(allow file-read* file-write* " + filter + ")\n", nil
+}
+
+// With no home argument the profile remains fully disposable (fixtures/smoke).
+func fxProfile(binary, dir string, denied []string, home ...string) (string, error) {
 	b, err := sandboxQuote(binary)
 	if err != nil {
 		return "", err
@@ -218,10 +315,13 @@ func fxProfile(binary, dir string, denied []string) (string, error) {
 	profile := `(version 1)
 (allow default)
 (deny file-read*)
+; macOS getaddrinfo inspects the /var symlink while resolving DNS.
+(allow file-read-metadata (literal "/var"))
 (allow file-read*
  (literal "/")
  (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share")
  (subpath "/Library/Apple/System") (subpath "/private/etc")
+ (literal "/Library/Keychains/System.keychain")
  (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom")
  (literal ` + b + `) (subpath ` + d + `))
 (deny file-write*)
@@ -235,7 +335,14 @@ func fxProfile(binary, dir string, denied []string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		profile += "(deny file-read* (subpath " + q + "))\n"
+		profile += "(deny file-read* file-write* (subpath " + q + "))\n"
+	}
+	if len(home) > 0 {
+		shared, err := fxSharedProfile(home[0], denied)
+		if err != nil {
+			return "", err
+		}
+		profile += shared
 	}
 	return profile, nil
 }
@@ -267,9 +374,13 @@ func nativeFX(binary string) error {
 	return errors.New("fx must be a native Mach-O executable, not a script or wrapper")
 }
 
-func fxEnv(dir string) []string {
+func fxEnv(dir string, home ...string) []string {
+	userHome := dir
+	if len(home) > 0 {
+		userHome = home[0]
+	}
 	env := []string{
-		"HOME=" + dir, "CFFIXED_USER_HOME=" + dir,
+		"HOME=" + userHome, "CFFIXED_USER_HOME=" + userHome,
 		"XDG_CONFIG_HOME=" + dir, "XDG_DATA_HOME=" + dir,
 		"XDG_CACHE_HOME=" + dir, "XDG_STATE_HOME=" + dir,
 		"TMPDIR=" + dir + string(os.PathSeparator), "PATH=/usr/bin:/bin",
@@ -344,14 +455,22 @@ func (f FX) ask(ctx context.Context, system, prompt string) ([]byte, error) {
 		return nil, err
 	}
 	defer os.RemoveAll(dir)
-	profile, err := fxProfile(binary, dir, denied)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	home, err = canonicalFXPath(home)
+	if err != nil {
+		return nil, fmt.Errorf("sandbox HOME: %w", err)
+	}
+	profile, err := fxProfile(binary, dir, denied, home)
 	if err != nil {
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, "/usr/bin/sandbox-exec", "-p", profile,
 		binary, "ask", "--no-save", "--no-color", "--json", "--system", system)
 	cmd.Dir = dir
-	cmd.Env = fxEnv(dir)
+	cmd.Env = fxEnv(dir, home)
 	cmd.Stdin = strings.NewReader(prompt)
 	cmd.WaitDelay = 2 * time.Second
 	var stdout, stderr fxBuffer
@@ -361,7 +480,7 @@ func (f FX) ask(ctx context.Context, system, prompt string) ([]byte, error) {
 			return nil, ctx.Err()
 		}
 		// Do not echo stderr: provider diagnostics can contain credentials/context.
-		return nil, fmt.Errorf("sandboxed fx failed (no unsandboxed fallback): %w", err)
+		return nil, fmt.Errorf("sandboxed fx failed (no unsandboxed fallback); check fx status / fx login for saved authentication: %w", err)
 	}
 	return stdout.Bytes(), nil
 }

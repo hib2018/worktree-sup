@@ -1,6 +1,7 @@
 package wsup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -87,10 +88,12 @@ func TestFXProfile(t *testing.T) {
 	}
 	for _, fragment := range []string{
 		"(deny file-write*)", `(allow file-write* (subpath "/private/tmp/empty"))`,
-		"(deny file-read*)", `(deny file-read* (subpath "/repo"))`,
-		`(deny file-read* (subpath "/git-common"))`, "(deny process-fork)",
+		"(deny file-read*)", `(deny file-read* file-write* (subpath "/repo"))`,
+		`(literal "/Library/Keychains/System.keychain")`,
+		`(allow file-read-metadata (literal "/var"))`,
+		`(deny file-read* file-write* (subpath "/git-common"))`, "(deny process-fork)",
 		`(deny process-exec)`, `(allow process-exec (literal "/opt/bin/fx"))`,
-		"(deny file-read* (subpath " + q + "))",
+		"(deny file-read* file-write* (subpath " + q + "))",
 	} {
 		if !strings.Contains(profile, fragment) {
 			t.Errorf("missing %s", fragment)
@@ -140,6 +143,73 @@ func TestFXEnvironmentAndPaths(t *testing.T) {
 	}
 }
 
+func TestFXSharedProfile(t *testing.T) {
+	home, err := canonicalFXPath(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(home, ".fx")
+	if err := os.Mkdir(config, 0700); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := fxProfile("/opt/bin/fx", "/private/tmp/isolated", []string{"/repo"}, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range fxSharedFiles {
+		q, _ := sandboxQuote(filepath.Join(config, name))
+		if !strings.Contains(profile, "(allow file-read* (literal "+q+"))") {
+			t.Errorf("missing read: %s", name)
+		}
+		write := "(allow file-write* (literal " + q + "))"
+		if strings.Contains(profile, write) != (name != "settings.json") {
+			t.Errorf("wrong write permission: %s", name)
+		}
+	}
+	if strings.Contains(profile, "(subpath \""+home) {
+		t.Fatal("broad home grant")
+	}
+	configQuote, _ := sandboxQuote(config)
+	if !strings.Contains(profile, "(allow file-write-mode (literal "+configQuote+"))") {
+		t.Fatal("missing credential-directory mode permission")
+	}
+	if strings.Contains(profile, "(allow file-write* (literal "+configQuote+"))") {
+		t.Fatal("broad credential-directory write grant")
+	}
+	for _, path := range []string{home, config, filepath.Join(config, "repo")} {
+		if _, err := fxProfile("/fx", "/private/tmp/isolated", []string{path}, home); err == nil {
+			t.Errorf("accepted overlap: %s", path)
+		}
+	}
+	for _, name := range append(append([]string{}, fxSharedFiles...), ".tmp.fixture", "auth.json.tmp.fixture") {
+		path := filepath.Join(config, name)
+		if err := os.Symlink("/repo/secret", path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fxProfile("/fx", "/private/tmp/isolated", nil, home); err == nil {
+			t.Errorf("accepted symlink: %s", name)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(config); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), config); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fxProfile("/fx", "/private/tmp/isolated", nil, home); err == nil {
+		t.Fatal("accepted .fx symlink")
+	}
+	env := strings.Join(fxEnv("/private/tmp/isolated", home), "\n")
+	for _, value := range []string{"HOME=" + home, "CFFIXED_USER_HOME=" + home, "XDG_CONFIG_HOME=/private/tmp/isolated", "XDG_DATA_HOME=/private/tmp/isolated", "XDG_CACHE_HOME=/private/tmp/isolated", "XDG_STATE_HOME=/private/tmp/isolated", "TMPDIR=/private/tmp/isolated/"} {
+		if !strings.Contains("\n"+env+"\n", "\n"+value+"\n") {
+			t.Errorf("missing environment entry: %s", value)
+		}
+	}
+}
+
 func TestFXFailClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -169,15 +239,17 @@ func TestFXFailClosed(t *testing.T) {
 // This fixture is a native executable, not a shell wrapper. It never calls a
 // model. It actively probes the same enforced sandbox used by FX.ask.
 const fxFixture = `package main
-import("encoding/json"; "fmt"; "io"; "os"; "os/exec"; "path/filepath"; "strings"; "time")
+import("encoding/json"; "fmt"; "io"; "os"; "os/exec"; "path/filepath"; "strings"; "time"; "syscall")
 func fail(s string) { fmt.Fprintln(os.Stderr,s); os.Exit(12) }
 func main() {
  if len(os.Args)!=7 || strings.Join(os.Args[1:6]," ")!="ask --no-save --no-color --json --system" { fail("arguments") }
  data,_:=io.ReadAll(os.Stdin)
  var in map[string]string
  if json.Unmarshal(data,&in)!=nil { fail("stdin") }
+ if _,err:=os.Lstat("/var"); err!=nil { fail("DNS symlink metadata") }
  cwd,_:=os.Getwd()
- if cwd!=os.Getenv("HOME") || cwd!=os.Getenv("XDG_CONFIG_HOME") { fail("home") }
+ if cwd!=os.Getenv("XDG_CONFIG_HOME") || os.Getenv("HOME")!=os.Getenv("CFFIXED_USER_HOME") { fail("home") }
+ if in["expectedHome"]!="" && os.Getenv("HOME")!=in["expectedHome"] { fail("shared home") }
  if _,err:=os.Stat(filepath.Join(cwd,".fx")); err==nil { fail("inherited config") }
  if os.Getenv("FX_CONFIG")!="" || os.Getenv("WSUP_UNSAFE")!="" { fail("inherited env") }
  if in["mode"]=="sleep" { time.Sleep(30*time.Second) }
@@ -187,6 +259,7 @@ func main() {
  if in["mode"]=="audit" {
   for _,key:=range []string{"root","common","alias","home"} {
    if _,err:=os.ReadFile(in[key]); err==nil { fail("read "+key) }
+   if err:=os.WriteFile(in[key],[]byte("bad"),0600); err==nil { fail("write "+key) }
   }
   if err:=os.WriteFile(in["outside"],[]byte("bad"),0600); err==nil { fail("outside write") }
   if err:=os.WriteFile(filepath.Join(cwd,"allowed"),[]byte("ok"),0600); err!=nil { fail("inside write: "+err.Error()) }
@@ -194,6 +267,50 @@ func main() {
    cmd:=exec.Command(bin,"--version")
    if err:=cmd.Start(); err==nil { cmd.Process.Kill(); cmd.Wait(); fail("child execution") }
   }
+ }
+ if in["mode"]=="saved" {
+  home:=os.Getenv("HOME")
+  config:=filepath.Join(home,".fx")
+  if err:=os.Chmod(config,0700); err!=nil { fail("credential directory mode") }
+  if err:=os.Chmod(home,0700); err==nil { fail("home mode write") }
+  if err:=os.Chmod(filepath.Join(config,"settings.json"),0600); err==nil { fail("settings mode write") }
+  if _,err:=os.Stat(filepath.Dir(home)); err!=nil { fail("home parent metadata") }
+  for _,path:=range []string{home,config} {
+   if _,err:=os.ReadDir(path); err!=nil { fail("config directory discovery") }
+  }
+  for _,name:=range []string{"settings.json","auth.json","chatgpt-auth.json","grok-auth.json"} {
+   data,err:=os.ReadFile(filepath.Join(config,name)); if err!=nil || string(data)!="dummy" { fail("saved read "+name) }
+  }
+  for _,name:=range []string{"settings.lock","auth.lock","chatgpt-auth.lock","grok-auth.lock"} {
+   path:=filepath.Join(config,name)
+   f,err:=os.OpenFile(path,os.O_CREATE|os.O_RDWR,0600); if err!=nil { fail("lock create "+name) }
+   if err:=syscall.Flock(int(f.Fd()),syscall.LOCK_EX|syscall.LOCK_NB); err!=nil { fail("lock acquire") }
+   syscall.Flock(int(f.Fd()),syscall.LOCK_UN); f.Close()
+   if err:=os.Remove(path); err!=nil { fail("lock remove") }
+  }
+  for _,name:=range []string{"auth.json","chatgpt-auth.json","grok-auth.json"} {
+   for _,tmp:=range []string{".tmp.fixture",name+".tmp.fixture"} {
+    path:=filepath.Join(config,tmp)
+    if err:=os.WriteFile(path,[]byte("refreshed"),0600); err!=nil { fail("stage create "+tmp) }
+    if err:=os.Rename(path,filepath.Join(config,name)); err!=nil { fail("auth replace "+tmp) }
+    data,err:=os.ReadFile(filepath.Join(config,name)); if err!=nil || string(data)!="refreshed" { fail("auth reread") }
+   }
+  }
+  if err:=os.Mkdir(filepath.Join(config,".tmp.nested"),0700); err!=nil { fail("stage directory") }
+  defer os.Remove(filepath.Join(config,".tmp.nested"))
+  for _,name:=range []string{"settings.json","unrelated","settings.json.tmp.fixture","auth.json.tmp.",".tmp.",".tmp.nested/child"} {
+   path:=filepath.Join(config,name)
+   if err:=os.WriteFile(path,[]byte("bad"),0600); err==nil { fail("config write "+name) }
+  }
+  if err:=os.Rename(filepath.Join(config,"auth.json"),filepath.Join(config,"settings.json")); err==nil { fail("settings replace") }
+  if err:=os.Remove(filepath.Join(config,"settings.json")); err==nil { fail("settings remove") }
+  link:=filepath.Join(config,"auth.json.tmp.link")
+  if err:=os.Symlink(in["root"],link); err!=nil { fail("stage symlink") }
+  defer os.Remove(link)
+  for _,name:=range []string{"unrelated",".tmp.nested/child","auth.json.tmp.link"} {
+   if _,err:=os.ReadFile(filepath.Join(config,name)); err==nil { fail("config read "+name) }
+  }
+  if err:=os.WriteFile(link,[]byte("bad"),0600); err==nil { fail("symlink write") }
  }
  text:=""
  if _,ok:=in["context"]; ok {
@@ -237,6 +354,24 @@ func TestFXSandbox(t *testing.T) {
 	if err := os.WriteFile(home, []byte("MCP config must not be inherited"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	fakeHomePath := filepath.Join(t.TempDir(), `home"\.[test]+(x)`)
+	if err := os.Mkdir(fakeHomePath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	fakeHome, err := canonicalFXPath(fakeHomePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", fakeHome)
+	config := filepath.Join(fakeHome, ".fx")
+	if err := os.Mkdir(config, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"settings.json", "auth.json", "chatgpt-auth.json", "grok-auth.json", "unrelated"} {
+		if err := os.WriteFile(filepath.Join(config, name), []byte("dummy"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	engine := FX{DenyPaths: []string{root, common}}
 	probeDir, err := os.MkdirTemp("/private/tmp", "wsup-fx-probe-")
 	if err != nil {
@@ -253,6 +388,30 @@ func TestFXSandbox(t *testing.T) {
 	probe.Stdin = strings.NewReader(`{}`)
 	if out, err := probe.CombinedOutput(); err != nil {
 		t.Fatalf("native fixture startup: %v: %s", err, out)
+	}
+	savedPrompt, _ := json.Marshal(map[string]string{"mode": "saved", "expectedHome": fakeHome, "root": rootFile})
+	sharedProfile, err := fxProfile(realBinary, probeDir, nil, fakeHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedProbe := exec.Command("/usr/bin/sandbox-exec", "-p", sharedProfile, realBinary, "ask", "--no-save", "--no-color", "--json", "--system", resolutionSystem)
+	sharedProbe.Dir, sharedProbe.Env = probeDir, fxEnv(probeDir, fakeHome)
+	sharedProbe.Stdin = bytes.NewReader(savedPrompt)
+	if out, err := sharedProbe.CombinedOutput(); err != nil {
+		t.Fatalf("dummy shared fixture: %v: %s", err, out)
+	}
+	for _, name := range []string{"auth.json", "chatgpt-auth.json", "grok-auth.json"} {
+		if err := os.WriteFile(filepath.Join(config, name), []byte("dummy"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := engine.Resolve(context.Background(), string(savedPrompt)); err != nil {
+		t.Fatalf("saved auth: %v", err)
+	}
+	for _, path := range []string{fakeHome, config} {
+		if _, err := (FX{DenyPaths: []string{path}}).Resolve(context.Background(), `{}`); err == nil || !strings.Contains(err.Error(), "overlaps") {
+			t.Fatalf("shared overlap: %v", err)
+		}
 	}
 	n, err := engine.Name(context.Background(), "name intent", "context\n--system malicious")
 	if err != nil || n.Branch != "topic/test" {
@@ -291,6 +450,29 @@ func TestFXSandbox(t *testing.T) {
 	if _, err := (FX{DenyPaths: []string{filepath.Join(root, "missing")}}).Resolve(context.Background(), `{}`); err == nil {
 		t.Fatal("missing deny path did not fail closed")
 	}
+}
+
+// Opt in explicitly: this sends only dummy task text and may use model credits.
+func TestFXInstalledConnection(t *testing.T) {
+	if os.Getenv("WSUP_FX_LIVE") != "1" {
+		t.Skip("set WSUP_FX_LIVE=1 to verify the installed fx connection with a real model")
+	}
+	if runtime.GOOS != "darwin" {
+		t.Skip("installed fx connection requires macOS sandbox-exec")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	n, err := (FX{}).Name(ctx, "Verify the worktree manager connection", "Suggest a short connection-check branch name and a concise Japanese task summary. Do not use tools.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidBranch(n.Branch); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(n.Summary) == "" {
+		t.Fatal("missing summary")
+	}
+	t.Log("Authenticated fx request succeeded; naming output is valid")
 }
 
 // Opt in with WSUP_FX_SMOKE=1 go test -run TestFXInstalledSmoke -v ./internal/wsup.

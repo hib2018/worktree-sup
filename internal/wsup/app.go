@@ -20,7 +20,7 @@ const help = `worktree-sup (wsup) — Git worktree management CLI powered by fx
   wsup new [--base BRANCH] [TASK]
   wsup issue [--base BRANCH]      Create worktrees for all open GitHub issues (requires gh)
   wsup list
-  wsup merge [--target BRANCH]    Select from the list
+  wsup merge [--target BRANCH]    Select numbers (e.g. 1 3) or all from the list
   wsup remove                    Select from the list
   wsup config test -- COMMAND [ARGS...]
   wsup config test --clear
@@ -217,13 +217,20 @@ func (a *App) list() error {
 	return writeTable(a.Out, rows)
 }
 func (a *App) selectEntry() (Entry, error) {
-	trees, err := a.Repo.Worktrees()
+	entries, err := a.selectEntries(false)
 	if err != nil {
 		return Entry{}, err
 	}
+	return entries[0], nil
+}
+func (a *App) selectEntries(multiple bool) ([]Entry, error) {
+	trees, err := a.Repo.Worktrees()
+	if err != nil {
+		return nil, err
+	}
 	m, err := a.loadMetadata()
 	if err != nil {
-		return Entry{}, err
+		return nil, err
 	}
 	var candidates []Entry
 	for _, t := range trees {
@@ -233,18 +240,44 @@ func (a *App) selectEntry() (Entry, error) {
 		}
 	}
 	if len(candidates) == 0 {
-		return Entry{}, errors.New("no managed worktrees; create one with wsup new")
+		return nil, errors.New("no managed worktrees; create one with wsup new")
 	}
-	choice, err := a.ask("Selection number")
+	prompt := "Selection number"
+	if multiple {
+		prompt = "Selection numbers in merge order (e.g. 1 3) or all"
+	}
+	choice, err := a.ask(prompt)
 	if err != nil {
-		return Entry{}, err
+		return nil, err
 	}
-	n, err := strconv.Atoi(choice)
-	if err != nil || n < 1 || n > len(candidates) {
-		return Entry{}, errors.New("invalid selection number")
+	choices := []string{choice}
+	if multiple {
+		choices = strings.Fields(choice)
+		if choice == "all" {
+			choices = nil
+			for i := range candidates {
+				choices = append(choices, strconv.Itoa(i+1))
+			}
+		}
 	}
-	e := candidates[n-1]
-	return e, a.verifyEntry(e)
+	if len(choices) == 0 {
+		return nil, errors.New("invalid selection number")
+	}
+	var selected []Entry
+	seen := map[int]bool{}
+	for _, choice := range choices {
+		n, err := strconv.Atoi(choice)
+		if err != nil || n < 1 || n > len(candidates) || seen[n] {
+			return nil, errors.New("invalid selection number")
+		}
+		seen[n] = true
+		e := candidates[n-1]
+		if err := a.verifyEntry(e); err != nil {
+			return nil, err
+		}
+		selected = append(selected, e)
+	}
+	return selected, nil
 }
 func (a *App) verifyEntry(e Entry) error {
 	if err := ValidBranch(e.Branch); err != nil {
@@ -475,17 +508,51 @@ func (a *App) merge(ctx context.Context, args []string) error {
 	if f.NArg() != 0 {
 		return errors.New("select from the list")
 	}
-	e, err := a.selectEntry()
+	entries, err := a.selectEntries(true)
 	if err != nil {
 		return err
 	}
-	if *target == "" {
-		*target = e.Target
+	completed := 0
+	defer func() {
+		if completed < len(entries) {
+			fmt.Fprintln(a.Out, "Batch stopped. Remaining selections (rerun wsup merge after resolving the current operation):")
+			for _, e := range entries[completed:] {
+				fmt.Fprintln(a.Out, e.Branch)
+			}
+		}
+	}()
+	for i, e := range entries {
+		s := &State{}
+		if err := a.mergeEntry(ctx, e, *target, s); err != nil {
+			return err
+		}
+		completed++
+		if s.Resolution != nil && i+1 < len(entries) {
+			yes, err := a.confirm("Conflict resolved. Continue with the next selected merge?")
+			if err != nil {
+				return err
+			}
+			if !yes {
+				return errors.New("batch merge continuation declined")
+			}
+		}
 	}
-	if *target == e.Branch {
+	return nil
+}
+func (a *App) mergeEntry(ctx context.Context, e Entry, target string, s *State) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := a.verifyEntry(e); err != nil {
+		return err
+	}
+	if target == "" {
+		target = e.Target
+	}
+	if target == e.Branch {
 		return errors.New("cannot merge a branch into itself")
 	}
-	path, err := a.targetPath(*target)
+	path, err := a.targetPath(target)
 	if err != nil {
 		return err
 	}
@@ -498,7 +565,7 @@ func (a *App) merge(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	targetHEAD, err := a.branchHEAD(*target)
+	targetHEAD, err := a.branchHEAD(target)
 	if err != nil {
 		return err
 	}
@@ -506,7 +573,7 @@ func (a *App) merge(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	e.Target = *target
+	e.Target = target
 	m, err := a.loadMetadata()
 	if err != nil {
 		return err
@@ -515,7 +582,7 @@ func (a *App) merge(ctx context.Context, args []string) error {
 	if err = writeJSON(a.storage("metadata.json"), m); err != nil {
 		return err
 	}
-	s := &State{Kind: "merge", Stage: "planned", Source: e.Branch, Target: *target, SourcePath: e.Path, TargetPath: path, SourceHEAD: sourceHEAD, TargetHEAD: targetHEAD, Snapshot: snap}
+	*s = State{Kind: "merge", Stage: "planned", Source: e.Branch, Target: target, SourcePath: e.Path, TargetPath: path, SourceHEAD: sourceHEAD, TargetHEAD: targetHEAD, Snapshot: snap}
 	fmt.Fprintf(a.Out, "Source: %s\nTarget: %s (%s)\nA normal Git merge may create conflict markers and other changes.\n", s.Source, s.Target, path)
 	if err = a.saveState(s); err != nil {
 		return err
